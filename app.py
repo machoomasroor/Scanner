@@ -1,15 +1,15 @@
 from flask import Flask, request, jsonify
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 DB_FILE = "licenses.json"
 
-TRIAL_DAYS = 5
-GLOBAL_BATCH = "DEFAULT"
-GLOBAL_SERIAL = "TRIAL-KEY-0001"
+# Default trial settings
+DEFAULT_TRIAL_DAYS = 5
+DEFAULT_MAX_MACHINES_PER_SERIAL = 1  # how many machines can use one trial key
 
 
 # -------------------------------------------------------
@@ -17,9 +17,15 @@ GLOBAL_SERIAL = "TRIAL-KEY-0001"
 # -------------------------------------------------------
 def load_db():
     if not os.path.exists(DB_FILE):
-        return {}
+        return {"serials": {}}
     with open(DB_FILE, "r") as f:
-        return json.load(f)
+        try:
+            data = json.load(f)
+        except Exception:
+            data = {}
+    if "serials" not in data:
+        data["serials"] = {}
+    return data
 
 
 def save_db(data):
@@ -27,18 +33,42 @@ def save_db(data):
         json.dump(data, f, indent=4)
 
 
-def ensure_structure(db):
-    if GLOBAL_BATCH not in db:
-        db[GLOBAL_BATCH] = {}
-    if GLOBAL_SERIAL not in db[GLOBAL_BATCH]:
-        db[GLOBAL_BATCH][GLOBAL_SERIAL] = {"machines": {}}
-    if "machines" not in db[GLOBAL_BATCH][GLOBAL_SERIAL]:
-        db[GLOBAL_BATCH][GLOBAL_SERIAL]["machines"] = {}
+def ensure_serial_entry(db, serial):
+    """
+    Per-user trial:
+    Each serial key has its own record:
+      - trial_days
+      - max_machines
+      - machines: { machine_id: {...} }
+    """
+    if "serials" not in db:
+        db["serials"] = {}
+    if serial not in db["serials"]:
+        db["serials"][serial] = {
+            "created_at": datetime.utcnow().isoformat(),
+            "trial_days": DEFAULT_TRIAL_DAYS,
+            "max_machines": DEFAULT_MAX_MACHINES_PER_SERIAL,
+            "machines": {}
+        }
+    if "machines" not in db["serials"][serial]:
+        db["serials"][serial]["machines"] = {}
     return db
 
 
 # -------------------------------------------------------
-# LICENSE VALIDATION (5-DAY TRIAL PER MACHINE, GLOBAL KEY)
+# UTILS
+# -------------------------------------------------------
+def utc_now():
+    return datetime.utcnow()
+
+
+def parse_iso(ts: str) -> datetime:
+    return datetime.fromisoformat(ts)
+
+
+# -------------------------------------------------------
+# LICENSE VALIDATION
+# Per-user trial + anti-tamper + per-machine lock
 # -------------------------------------------------------
 @app.route("/validate", methods=["POST"])
 def validate():
@@ -49,108 +79,178 @@ def validate():
     if not serial or not machine_id:
         return jsonify({"status": "error", "message": "serial and machine_id required"}), 400
 
-    # Only one global key allowed
-    if serial != GLOBAL_SERIAL:
-        return jsonify({"status": "invalid"}), 403
-
     db = load_db()
-    db = ensure_structure(db)
+    db = ensure_serial_entry(db, serial)
 
-    machines = db[GLOBAL_BATCH][GLOBAL_SERIAL]["machines"]
+    serial_entry = db["serials"][serial]
+    trial_days = int(serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS))
+    max_machines = int(serial_entry.get("max_machines", DEFAULT_MAX_MACHINES_PER_SERIAL))
+    machines = serial_entry["machines"]
 
-    # First time this machine uses the key
-    if machine_id not in machines:
-        machines[machine_id] = {
-            "activation_date": datetime.now().strftime("%Y-%m-%d")
-        }
+    now = utc_now()
+
+    # -----------------------------
+    # 1) If machine already known
+    # -----------------------------
+    if machine_id in machines:
+        record = machines[machine_id]
+
+        # If already expired → permanent lock
+        if record.get("expired", False):
+            return jsonify({"status": "expired"}), 403
+
+        # Anti-tamper: detect time rollback using last_seen
+        last_seen_str = record.get("last_seen")
+        if last_seen_str:
+            try:
+                last_seen = parse_iso(last_seen_str)
+                # If current time is significantly before last_seen → time tampering
+                if now < last_seen - timedelta(minutes=5):
+                    record["expired"] = True
+                    record["reason"] = "time_tamper"
+                    record["last_seen"] = now.isoformat()
+                    save_db(db)
+                    return jsonify({"status": "expired", "reason": "time_tamper"}), 403
+            except Exception:
+                # If parsing fails, just overwrite last_seen
+                pass
+
+        # Normal trial calculation
+        activation_ts = parse_iso(record["activation_timestamp"])
+        days_passed = (now - activation_ts).days
+        days_left = trial_days - days_passed
+
+        # Update last_seen
+        record["last_seen"] = now.isoformat()
+
+        if days_left > 0:
+            save_db(db)
+            return jsonify({"status": "ok", "days_left": days_left})
+
+        # Trial ended → permanently lock this machine
+        record["expired"] = True
+        record["reason"] = "trial_ended"
         save_db(db)
-        return jsonify({"status": "activated", "days_left": TRIAL_DAYS})
+        return jsonify({"status": "expired"}), 403
 
-    # Machine already exists → check expiration
-    activation_date = datetime.strptime(
-        machines[machine_id]["activation_date"], "%Y-%m-%d"
-    )
-    days_passed = (datetime.now() - activation_date).days
-    days_left = TRIAL_DAYS - days_passed
+    # ------------------------------------
+    # 2) New machine for this trial serial
+    # ------------------------------------
+    # Enforce max machines per serial (per-user limit)
+    active_machines_count = 0
+    for mid, rec in machines.items():
+        if not rec.get("expired", False):
+            active_machines_count += 1
 
-    if days_left > 0:
-        return jsonify({"status": "ok", "days_left": days_left})
+    if active_machines_count >= max_machines:
+        # This serial already used on maximum allowed machines
+        return jsonify({"status": "denied", "message": "max_machines_reached"}), 403
 
-    # Trial expired for this machine
-    return jsonify({"status": "expired"}), 403
+    # First activation for this machine with this serial
+    machines[machine_id] = {
+        "activation_timestamp": now.isoformat(),
+        "last_seen": now.isoformat(),
+        "expired": False,
+        "reason": None,
+    }
+    save_db(db)
+    return jsonify({"status": "activated", "days_left": trial_days})
 
 
 # -------------------------------------------------------
-# ADMIN: KEY STATUS (PER-MACHINE TRIAL INFO)
+# ADMIN: SERIAL STATUS (PER-USER VIEW)
 # -------------------------------------------------------
-@app.route("/admin/key_status", methods=["GET"])
-def key_status():
+@app.route("/admin/serial_status/<serial>", methods=["GET"])
+def serial_status(serial):
     db = load_db()
-    db = ensure_structure(db)
+    if "serials" not in db or serial not in db["serials"]:
+        return jsonify({"error": "serial_not_found"}), 404
 
-    machines = db[GLOBAL_BATCH][GLOBAL_SERIAL]["machines"]
+    serial_entry = db["serials"][serial]
+    trial_days = int(serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS))
+    max_machines = int(serial_entry.get("max_machines", DEFAULT_MAX_MACHINES_PER_SERIAL))
+    machines = serial_entry.get("machines", {})
 
     active_machines = []
     expired_machines = []
 
+    now = utc_now()
+
     for machine_id, record in machines.items():
-        activation_date = datetime.strptime(record["activation_date"], "%Y-%m-%d")
-        days_passed = (datetime.now() - activation_date).days
-        days_left = TRIAL_DAYS - days_passed
+        activation_ts = parse_iso(record["activation_timestamp"])
+        days_passed = (now - activation_ts).days
+        days_left = max(trial_days - days_passed, 0)
+        expired = record.get("expired", False) or days_left <= 0
 
         info = {
             "machine_id": machine_id,
-            "activation_date": record["activation_date"],
+            "activation_timestamp": record["activation_timestamp"],
+            "last_seen": record.get("last_seen"),
             "days_passed": days_passed,
-            "days_left": max(days_left, 0)
+            "days_left": days_left,
+            "expired": expired,
+            "reason": record.get("reason"),
         }
 
-        if days_left > 0:
-            active_machines.append(info)
-        else:
+        if expired:
             expired_machines.append(info)
+        else:
+            active_machines.append(info)
 
-    return jsonify({
-        "serial": GLOBAL_SERIAL,
-        "total_machines": len(machines),
-        "active_count": len(active_machines),
-        "expired_count": len(expired_machines),
-        "active_machines": active_machines,
-        "expired_machines": expired_machines
-    })
+    return jsonify(
+        {
+            "serial": serial,
+            "trial_days": trial_days,
+            "max_machines": max_machines,
+            "total_machines": len(machines),
+            "active_count": len(active_machines),
+            "expired_count": len(expired_machines),
+            "active_machines": active_machines,
+            "expired_machines": expired_machines,
+        }
+    )
 
 
 # -------------------------------------------------------
-# ADMIN: SIMPLE STATS (COUNTS ONLY)
+# ADMIN: GLOBAL STATS
 # -------------------------------------------------------
 @app.route("/admin/stats", methods=["GET"])
 def stats():
     db = load_db()
-    db = ensure_structure(db)
+    serials = db.get("serials", {})
 
-    machines = db[GLOBAL_BATCH][GLOBAL_SERIAL]["machines"]
+    total_serials = len(serials)
+    total_machines = 0
+    total_active = 0
+    total_expired = 0
 
-    total = len(machines)
-    active = 0
-    expired = 0
+    now = utc_now()
 
-    for machine_id, record in machines.items():
-        activation_date = datetime.strptime(record["activation_date"], "%Y-%m-%d")
-        days_passed = (datetime.now() - activation_date).days
-        days_left = TRIAL_DAYS - days_passed
+    for serial, serial_entry in serials.items():
+        trial_days = int(serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS))
+        machines = serial_entry.get("machines", {})
 
-        if days_left > 0:
-            active += 1
-        else:
-            expired += 1
+        for machine_id, record in machines.items():
+            total_machines += 1
+            activation_ts = parse_iso(record["activation_timestamp"])
+            days_passed = (now - activation_ts).days
+            days_left = trial_days - days_passed
+            expired = record.get("expired", False) or days_left <= 0
+            if expired:
+                total_expired += 1
+            else:
+                total_active += 1
 
-    return jsonify({
-        "serial": GLOBAL_SERIAL,
-        "trial_days": TRIAL_DAYS,
-        "total_machines": total,
-        "active_machines": active,
-        "expired_machines": expired
-    })
+    return jsonify(
+        {
+            "total_serials": total_serials,
+            "total_machines": total_machines,
+            "active_machines": total_active,
+            "expired_machines": total_expired,
+            "default_trial_days": DEFAULT_TRIAL_DAYS,
+            "default_max_machines_per_serial": DEFAULT_MAX_MACHINES_PER_SERIAL,
+        }
+    )
 
 
 # -------------------------------------------------------
@@ -158,7 +258,7 @@ def stats():
 # -------------------------------------------------------
 @app.route("/")
 def home():
-    return "License server running (global 5-day trial per machine)"
+    return "Per-user 5-day trial server with basic anti-tamper running"
 
 
 # -------------------------------------------------------
