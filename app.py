@@ -22,7 +22,7 @@ def load_db():
         try:
             data = json.load(f)
         except Exception:
-            data = {}
+            data = {"serials": {}}
     if "serials" not in data:
         data["serials"] = {}
     return data
@@ -41,8 +41,6 @@ def ensure_serial_entry(db, serial):
       - max_machines
       - machines: { machine_id: {...} }
     """
-    if "serials" not in db:
-        db["serials"] = {}
     if serial not in db["serials"]:
         db["serials"][serial] = {
             "created_at": datetime.utcnow().isoformat(),
@@ -50,8 +48,6 @@ def ensure_serial_entry(db, serial):
             "max_machines": DEFAULT_MAX_MACHINES_PER_SERIAL,
             "machines": {}
         }
-    if "machines" not in db["serials"][serial]:
-        db["serials"][serial]["machines"] = {}
     return db
 
 
@@ -83,8 +79,8 @@ def validate():
     db = ensure_serial_entry(db, serial)
 
     serial_entry = db["serials"][serial]
-    trial_days = int(serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS))
-    max_machines = int(serial_entry.get("max_machines", DEFAULT_MAX_MACHINES_PER_SERIAL))
+    trial_days = serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS)
+    max_machines = serial_entry.get("max_machines", DEFAULT_MAX_MACHINES_PER_SERIAL)
     machines = serial_entry["machines"]
 
     now = utc_now()
@@ -104,7 +100,6 @@ def validate():
         if last_seen_str:
             try:
                 last_seen = parse_iso(last_seen_str)
-                # If current time is significantly before last_seen → time tampering
                 if now < last_seen - timedelta(minutes=5):
                     record["expired"] = True
                     record["reason"] = "time_tamper"
@@ -112,7 +107,6 @@ def validate():
                     save_db(db)
                     return jsonify({"status": "expired", "reason": "time_tamper"}), 403
             except Exception:
-                # If parsing fails, just overwrite last_seen
                 pass
 
         # Normal trial calculation
@@ -136,14 +130,11 @@ def validate():
     # ------------------------------------
     # 2) New machine for this trial serial
     # ------------------------------------
-    # Enforce max machines per serial (per-user limit)
-    active_machines_count = 0
-    for mid, rec in machines.items():
-        if not rec.get("expired", False):
-            active_machines_count += 1
+    active_machines_count = sum(
+        1 for rec in machines.values() if not rec.get("expired", False)
+    )
 
     if active_machines_count >= max_machines:
-        # This serial already used on maximum allowed machines
         return jsonify({"status": "denied", "message": "max_machines_reached"}), 403
 
     # First activation for this machine with this serial
@@ -163,12 +154,12 @@ def validate():
 @app.route("/admin/serial_status/<serial>", methods=["GET"])
 def serial_status(serial):
     db = load_db()
-    if "serials" not in db or serial not in db["serials"]:
+    if serial not in db["serials"]:
         return jsonify({"error": "serial_not_found"}), 404
 
     serial_entry = db["serials"][serial]
-    trial_days = int(serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS))
-    max_machines = int(serial_entry.get("max_machines", DEFAULT_MAX_MACHINES_PER_SERIAL))
+    trial_days = serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS)
+    max_machines = serial_entry.get("max_machines", DEFAULT_MAX_MACHINES_PER_SERIAL)
     machines = serial_entry.get("machines", {})
 
     active_machines = []
@@ -197,18 +188,16 @@ def serial_status(serial):
         else:
             active_machines.append(info)
 
-    return jsonify(
-        {
-            "serial": serial,
-            "trial_days": trial_days,
-            "max_machines": max_machines,
-            "total_machines": len(machines),
-            "active_count": len(active_machines),
-            "expired_count": len(expired_machines),
-            "active_machines": active_machines,
-            "expired_machines": expired_machines,
-        }
-    )
+    return jsonify({
+        "serial": serial,
+        "trial_days": trial_days,
+        "max_machines": max_machines,
+        "total_machines": len(machines),
+        "active_count": len(active_machines),
+        "expired_count": len(expired_machines),
+        "active_machines": active_machines,
+        "expired_machines": expired_machines,
+    })
 
 
 # -------------------------------------------------------
@@ -227,7 +216,7 @@ def stats():
     now = utc_now()
 
     for serial, serial_entry in serials.items():
-        trial_days = int(serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS))
+        trial_days = serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS)
         machines = serial_entry.get("machines", {})
 
         for machine_id, record in machines.items():
@@ -241,16 +230,26 @@ def stats():
             else:
                 total_active += 1
 
-    return jsonify(
-        {
-            "total_serials": total_serials,
-            "total_machines": total_machines,
-            "active_machines": total_active,
-            "expired_machines": total_expired,
-            "default_trial_days": DEFAULT_TRIAL_DAYS,
-            "default_max_machines_per_serial": DEFAULT_MAX_MACHINES_PER_SERIAL,
-        }
-    )
+    return jsonify({
+        "total_serials": total_serials,
+        "total_machines": total_machines,
+        "active_machines": total_active,
+        "expired_machines": total_expired,
+        "default_trial_days": DEFAULT_TRIAL_DAYS,
+        "default_max_machines_per_serial": DEFAULT_MAX_MACHINES_PER_SERIAL,
+    })
+
+
+# -------------------------------------------------------
+# ADMIN: DOWNLOAD FULL DATABASE
+# -------------------------------------------------------
+@app.route("/licenses.json", methods=["GET"])
+def download_db():
+    if not os.path.exists(DB_FILE):
+        return jsonify({"serials": {}})
+    with open(DB_FILE, "r") as f:
+        data = json.load(f)
+    return jsonify(data)
 
 
 # -------------------------------------------------------
@@ -258,7 +257,7 @@ def stats():
 # -------------------------------------------------------
 @app.route("/")
 def home():
-    return "Per-user 5-day trial server with basic anti-tamper running"
+    return "Per-user 5-day trial server with anti-tamper running"
 
 
 # -------------------------------------------------------
