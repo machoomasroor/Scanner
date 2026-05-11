@@ -9,7 +9,7 @@ DB_FILE = "licenses.json"
 
 # Default trial settings
 DEFAULT_TRIAL_DAYS = 5
-DEFAULT_MAX_MACHINES_PER_SERIAL = 999999999  # how many machines can use one trial key
+DEFAULT_MAX_MACHINES_PER_SERIAL = 999999990  # how many machines can use one trial key
 
 
 # -------------------------------------------------------
