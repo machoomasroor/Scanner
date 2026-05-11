@@ -1,7 +1,3 @@
 {
-    "DEFAULT": {
-        "TRIAL-KEY-0001": {
-            "machines": {}
-        }
-    }
+    "serials": {}
 }
