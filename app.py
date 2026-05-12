@@ -6,10 +6,11 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 DB_FILE = "licenses.json"
+BANNED_MACHINES_FILE = "banned_machines.json"
 
 # Default trial settings
 DEFAULT_TRIAL_DAYS = 5
-DEFAULT_MAX_MACHINES_PER_SERIAL = 999999990  # how many machines can use one trial key
+DEFAULT_MAX_MACHINES_PER_SERIAL = 999999990  # unlimited machines per trial key
 
 
 # -------------------------------------------------------
@@ -18,14 +19,11 @@ DEFAULT_MAX_MACHINES_PER_SERIAL = 999999990  # how many machines can use one tri
 def load_db():
     if not os.path.exists(DB_FILE):
         return {"serials": {}}
-    with open(DB_FILE, "r") as f:
-        try:
-            data = json.load(f)
-        except Exception:
-            data = {"serials": {}}
-    if "serials" not in data:
-        data["serials"] = {}
-    return data
+    try:
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"serials": {}}
 
 
 def save_db(data):
@@ -34,13 +32,6 @@ def save_db(data):
 
 
 def ensure_serial_entry(db, serial):
-    """
-    Per-user trial:
-    Each serial key has its own record:
-      - trial_days
-      - max_machines
-      - machines: { machine_id: {...} }
-    """
     if serial not in db["serials"]:
         db["serials"][serial] = {
             "created_at": datetime.utcnow().isoformat(),
@@ -49,6 +40,24 @@ def ensure_serial_entry(db, serial):
             "machines": {}
         }
     return db
+
+
+# -------------------------------------------------------
+# BANNED MACHINE HELPERS
+# -------------------------------------------------------
+def load_banned():
+    if not os.path.exists(BANNED_MACHINES_FILE):
+        return []
+    try:
+        with open(BANNED_MACHINES_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def save_banned(banned):
+    with open(BANNED_MACHINES_FILE, "w") as f:
+        json.dump(banned, f, indent=4)
 
 
 # -------------------------------------------------------
@@ -62,9 +71,26 @@ def parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
 
+def compute_remaining_time(activation_ts: datetime, trial_days: int):
+    now = utc_now()
+    delta = now - activation_ts
+
+    total_hours_passed = int(delta.total_seconds() // 3600)
+    trial_hours = trial_days * 24
+
+    remaining_hours = trial_hours - total_hours_passed
+
+    if remaining_hours <= 0:
+        return 0, 0, True
+
+    days_left = remaining_hours // 24
+    hours_left = remaining_hours % 24
+
+    return int(days_left), int(hours_left), False
+
+
 # -------------------------------------------------------
-# LICENSE VALIDATION
-# Per-user trial + anti-tamper + per-machine lock
+# STRICT TRIAL VALIDATION
 # -------------------------------------------------------
 @app.route("/validate", methods=["POST"])
 def validate():
@@ -74,6 +100,13 @@ def validate():
 
     if not serial or not machine_id:
         return jsonify({"status": "error", "message": "serial and machine_id required"}), 400
+
+    # ---------------------------------------------------
+    # STRICT RULE: If machine is banned → never allow trial again
+    # ---------------------------------------------------
+    banned = load_banned()
+    if machine_id in banned:
+        return jsonify({"status": "expired", "reason": "machine_banned"}), 403
 
     db = load_db()
     db = ensure_serial_entry(db, serial)
@@ -85,17 +118,21 @@ def validate():
 
     now = utc_now()
 
-    # -----------------------------
-    # 1) If machine already known
-    # -----------------------------
+    # ---------------------------------------------------
+    # 1) Machine already exists
+    # ---------------------------------------------------
     if machine_id in machines:
         record = machines[machine_id]
 
-        # If already expired → permanent lock
+        # Already expired → permanently banned
         if record.get("expired", False):
+            # Add to banned list if not already
+            if machine_id not in banned:
+                banned.append(machine_id)
+                save_banned(banned)
             return jsonify({"status": "expired"}), 403
 
-        # Anti-tamper: detect time rollback using last_seen
+        # Anti-tamper: detect time rollback
         last_seen_str = record.get("last_seen")
         if last_seen_str:
             try:
@@ -103,33 +140,45 @@ def validate():
                 if now < last_seen - timedelta(minutes=5):
                     record["expired"] = True
                     record["reason"] = "time_tamper"
-                    record["last_seen"] = now.isoformat()
                     save_db(db)
+
+                    # BAN MACHINE FOREVER
+                    if machine_id not in banned:
+                        banned.append(machine_id)
+                        save_banned(banned)
+
                     return jsonify({"status": "expired", "reason": "time_tamper"}), 403
-            except Exception:
+            except:
                 pass
 
-        # Normal trial calculation
+        # Real-time countdown
         activation_ts = parse_iso(record["activation_timestamp"])
-        days_passed = (now - activation_ts).days
-        days_left = trial_days - days_passed
+        days_left, hours_left, is_expired = compute_remaining_time(activation_ts, trial_days)
 
-        # Update last_seen
         record["last_seen"] = now.isoformat()
 
-        if days_left > 0:
+        if not is_expired:
             save_db(db)
-            return jsonify({"status": "ok", "days_left": days_left})
+            return jsonify({
+                "status": "ok",
+                "days_left": days_left,
+                "hours_left": hours_left
+            })
 
-        # Trial ended → permanently lock this machine
+        # Trial expired → permanent ban
         record["expired"] = True
         record["reason"] = "trial_ended"
         save_db(db)
+
+        if machine_id not in banned:
+            banned.append(machine_id)
+            save_banned(banned)
+
         return jsonify({"status": "expired"}), 403
 
-    # ------------------------------------
-    # 2) New machine for this trial serial
-    # ------------------------------------
+    # ---------------------------------------------------
+    # 2) New machine activation
+    # ---------------------------------------------------
     active_machines_count = sum(
         1 for rec in machines.values() if not rec.get("expired", False)
     )
@@ -137,19 +186,37 @@ def validate():
     if active_machines_count >= max_machines:
         return jsonify({"status": "denied", "message": "max_machines_reached"}), 403
 
-    # First activation for this machine with this serial
+    activation_ts = now
+    days_left, hours_left, is_expired = compute_remaining_time(activation_ts, trial_days)
+
     machines[machine_id] = {
-        "activation_timestamp": now.isoformat(),
+        "activation_timestamp": activation_ts.isoformat(),
         "last_seen": now.isoformat(),
         "expired": False,
         "reason": None,
     }
     save_db(db)
-    return jsonify({"status": "activated", "days_left": trial_days})
+
+    if is_expired:
+        machines[machine_id]["expired"] = True
+        machines[machine_id]["reason"] = "trial_ended"
+        save_db(db)
+
+        if machine_id not in banned:
+            banned.append(machine_id)
+            save_banned(banned)
+
+        return jsonify({"status": "expired"}), 403
+
+    return jsonify({
+        "status": "activated",
+        "days_left": days_left,
+        "hours_left": hours_left
+    })
 
 
 # -------------------------------------------------------
-# ADMIN: SERIAL STATUS (PER-USER VIEW)
+# ADMIN: SERIAL STATUS
 # -------------------------------------------------------
 @app.route("/admin/serial_status/<serial>", methods=["GET"])
 def serial_status(serial):
@@ -159,44 +226,36 @@ def serial_status(serial):
 
     serial_entry = db["serials"][serial]
     trial_days = serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS)
-    max_machines = serial_entry.get("max_machines", DEFAULT_MAX_MACHINES_PER_SERIAL)
     machines = serial_entry.get("machines", {})
 
-    active_machines = []
-    expired_machines = []
-
-    now = utc_now()
+    active = []
+    expired = []
 
     for machine_id, record in machines.items():
         activation_ts = parse_iso(record["activation_timestamp"])
-        days_passed = (now - activation_ts).days
-        days_left = max(trial_days - days_passed, 0)
-        expired = record.get("expired", False) or days_left <= 0
+        days_left, hours_left, is_expired = compute_remaining_time(activation_ts, trial_days)
+
+        expired_flag = record.get("expired", False) or is_expired
 
         info = {
             "machine_id": machine_id,
             "activation_timestamp": record["activation_timestamp"],
             "last_seen": record.get("last_seen"),
-            "days_passed": days_passed,
             "days_left": days_left,
-            "expired": expired,
+            "hours_left": hours_left,
+            "expired": expired_flag,
             "reason": record.get("reason"),
         }
 
-        if expired:
-            expired_machines.append(info)
+        if expired_flag:
+            expired.append(info)
         else:
-            active_machines.append(info)
+            active.append(info)
 
     return jsonify({
         "serial": serial,
-        "trial_days": trial_days,
-        "max_machines": max_machines,
-        "total_machines": len(machines),
-        "active_count": len(active_machines),
-        "expired_count": len(expired_machines),
-        "active_machines": active_machines,
-        "expired_machines": expired_machines,
+        "active_machines": active,
+        "expired_machines": expired,
     })
 
 
@@ -213,8 +272,6 @@ def stats():
     total_active = 0
     total_expired = 0
 
-    now = utc_now()
-
     for serial, serial_entry in serials.items():
         trial_days = serial_entry.get("trial_days", DEFAULT_TRIAL_DAYS)
         machines = serial_entry.get("machines", {})
@@ -222,10 +279,9 @@ def stats():
         for machine_id, record in machines.items():
             total_machines += 1
             activation_ts = parse_iso(record["activation_timestamp"])
-            days_passed = (now - activation_ts).days
-            days_left = trial_days - days_passed
-            expired = record.get("expired", False) or days_left <= 0
-            if expired:
+            days_left, hours_left, is_expired = compute_remaining_time(activation_ts, trial_days)
+            expired_flag = record.get("expired", False) or is_expired
+            if expired_flag:
                 total_expired += 1
             else:
                 total_active += 1
@@ -235,21 +291,18 @@ def stats():
         "total_machines": total_machines,
         "active_machines": total_active,
         "expired_machines": total_expired,
-        "default_trial_days": DEFAULT_TRIAL_DAYS,
-        "default_max_machines_per_serial": DEFAULT_MAX_MACHINES_PER_SERIAL,
     })
 
 
 # -------------------------------------------------------
-# ADMIN: DOWNLOAD FULL DATABASE
+# ADMIN: DOWNLOAD DATABASE
 # -------------------------------------------------------
 @app.route("/licenses.json", methods=["GET"])
 def download_db():
     if not os.path.exists(DB_FILE):
         return jsonify({"serials": {}})
     with open(DB_FILE, "r") as f:
-        data = json.load(f)
-    return jsonify(data)
+        return jsonify(json.load(f))
 
 
 # -------------------------------------------------------
@@ -257,7 +310,7 @@ def download_db():
 # -------------------------------------------------------
 @app.route("/")
 def home():
-    return "Per-user 5-day trial server with anti-tamper running"
+    return "Strict 5-day trial server with permanent machine ban running"
 
 
 # -------------------------------------------------------
