@@ -71,22 +71,24 @@ def parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
 
+# REAL FIX: return days + hours + minutes
 def compute_remaining_time(activation_ts: datetime, trial_days: int):
     now = utc_now()
     delta = now - activation_ts
 
-    total_hours_passed = int(delta.total_seconds() // 3600)
-    trial_hours = trial_days * 24
+    total_minutes_passed = int(delta.total_seconds() // 60)
+    trial_minutes = trial_days * 24 * 60
 
-    remaining_hours = trial_hours - total_hours_passed
+    remaining_minutes = trial_minutes - total_minutes_passed
 
-    if remaining_hours <= 0:
-        return 0, 0, True
+    if remaining_minutes <= 0:
+        return 0, 0, 0, True
 
-    days_left = remaining_hours // 24
-    hours_left = remaining_hours % 24
+    days_left = remaining_minutes // 1440
+    hours_left = (remaining_minutes % 1440) // 60
+    minutes_left = remaining_minutes % 60
 
-    return int(days_left), int(hours_left), False
+    return int(days_left), int(hours_left), int(minutes_left), False
 
 
 # -------------------------------------------------------
@@ -101,9 +103,6 @@ def validate():
     if not serial or not machine_id:
         return jsonify({"status": "error", "message": "serial and machine_id required"}), 400
 
-    # ---------------------------------------------------
-    # STRICT RULE: If machine is banned → never allow trial again
-    # ---------------------------------------------------
     banned = load_banned()
     if machine_id in banned:
         return jsonify({"status": "expired", "reason": "machine_banned"}), 403
@@ -124,15 +123,13 @@ def validate():
     if machine_id in machines:
         record = machines[machine_id]
 
-        # Already expired → permanently banned
         if record.get("expired", False):
-            # Add to banned list if not already
             if machine_id not in banned:
                 banned.append(machine_id)
                 save_banned(banned)
             return jsonify({"status": "expired"}), 403
 
-        # Anti-tamper: detect time rollback
+        # Anti-tamper
         last_seen_str = record.get("last_seen")
         if last_seen_str:
             try:
@@ -142,7 +139,6 @@ def validate():
                     record["reason"] = "time_tamper"
                     save_db(db)
 
-                    # BAN MACHINE FOREVER
                     if machine_id not in banned:
                         banned.append(machine_id)
                         save_banned(banned)
@@ -151,9 +147,8 @@ def validate():
             except:
                 pass
 
-        # Real-time countdown
         activation_ts = parse_iso(record["activation_timestamp"])
-        days_left, hours_left, is_expired = compute_remaining_time(activation_ts, trial_days)
+        days_left, hours_left, minutes_left, is_expired = compute_remaining_time(activation_ts, trial_days)
 
         record["last_seen"] = now.isoformat()
 
@@ -162,10 +157,11 @@ def validate():
             return jsonify({
                 "status": "ok",
                 "days_left": days_left,
-                "hours_left": hours_left
+                "hours_left": hours_left,
+                "minutes_left": minutes_left
             })
 
-        # Trial expired → permanent ban
+        # Trial expired
         record["expired"] = True
         record["reason"] = "trial_ended"
         save_db(db)
@@ -187,7 +183,7 @@ def validate():
         return jsonify({"status": "denied", "message": "max_machines_reached"}), 403
 
     activation_ts = now
-    days_left, hours_left, is_expired = compute_remaining_time(activation_ts, trial_days)
+    days_left, hours_left, minutes_left, is_expired = compute_remaining_time(activation_ts, trial_days)
 
     machines[machine_id] = {
         "activation_timestamp": activation_ts.isoformat(),
@@ -211,7 +207,8 @@ def validate():
     return jsonify({
         "status": "activated",
         "days_left": days_left,
-        "hours_left": hours_left
+        "hours_left": hours_left,
+        "minutes_left": minutes_left
     })
 
 
@@ -233,7 +230,7 @@ def serial_status(serial):
 
     for machine_id, record in machines.items():
         activation_ts = parse_iso(record["activation_timestamp"])
-        days_left, hours_left, is_expired = compute_remaining_time(activation_ts, trial_days)
+        days_left, hours_left, minutes_left, is_expired = compute_remaining_time(activation_ts, trial_days)
 
         expired_flag = record.get("expired", False) or is_expired
 
@@ -243,6 +240,7 @@ def serial_status(serial):
             "last_seen": record.get("last_seen"),
             "days_left": days_left,
             "hours_left": hours_left,
+            "minutes_left": minutes_left,
             "expired": expired_flag,
             "reason": record.get("reason"),
         }
@@ -279,7 +277,7 @@ def stats():
         for machine_id, record in machines.items():
             total_machines += 1
             activation_ts = parse_iso(record["activation_timestamp"])
-            days_left, hours_left, is_expired = compute_remaining_time(activation_ts, trial_days)
+            days_left, hours_left, minutes_left, is_expired = compute_remaining_time(activation_ts, trial_days)
             expired_flag = record.get("expired", False) or is_expired
             if expired_flag:
                 total_expired += 1
