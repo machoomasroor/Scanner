@@ -113,6 +113,14 @@ threading.Thread(target=watchdog, daemon=True).start()
 def home():
     return {"status": "running", "message": "Validation + KeepAlive loop active"}
 
+@app.head("/")
+def home_head():
+    return {}
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+@app.head("/health")
+def health_head():
+    return {}
