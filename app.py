@@ -2,6 +2,7 @@ import requests
 import json
 import time
 import threading
+import os
 from datetime import datetime
 from fastapi import FastAPI
 
@@ -11,8 +12,14 @@ from fastapi import FastAPI
 SERVER_VALIDATE = "https://license-server-3ciz.onrender.com"   # Server A (real validation)
 SERVER_PING = "https://license-server-1-o9cg.onrender.com"      # Server B (keep alive)
 
+# Set YOUR own Render service URL here so the service can ping itself to stay awake
+# Example: "https://license-server-1-o9cg.onrender.com"
+SELF_URL = os.environ.get("SELF_URL", "")
+
 SERIAL_KEY = "PLAN30-TEST-0001"
 MACHINE_ID = "machine1"
+
+INTERVAL_SECONDS = 60
 
 app = FastAPI()
 
@@ -40,40 +47,72 @@ def get(server):
 # ============================
 def background_loop():
     while True:
-        print("\n==============================================")
-        print("CHECK TIME:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        print("==============================================")
+        try:
+            print("\n==============================================")
+            print("CHECK TIME:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            print("==============================================")
 
-        # ---- VALIDATE ON SERVER A ----
-        payload = {
-            "serial": SERIAL_KEY,
-            "machine_id": MACHINE_ID
-        }
+            # ---- SELF-PING to prevent Render free tier spin-down ----
+            if SELF_URL:
+                try:
+                    requests.get(SELF_URL, timeout=10)
+                    print("Self-ping OK:", SELF_URL)
+                except Exception as e:
+                    print("Self-ping failed (non-fatal):", str(e))
 
-        print("\n--- VALIDATING ON SERVER A ---")
-        srv, status, data = post(SERVER_VALIDATE, "/validate", payload)
-        print("Server:", srv)
-        print("Status:", status)
-        print(json.dumps(data, indent=4, default=str))
+            # ---- VALIDATE ON SERVER A ----
+            payload = {
+                "serial": SERIAL_KEY,
+                "machine_id": MACHINE_ID
+            }
 
-        # ---- PING SERVER B TO KEEP ALIVE ----
-        print("\n--- PINGING SERVER B (KEEP ALIVE) ---")
-        srv, status, data = get(SERVER_PING)
-        print("Server:", srv)
-        print("Status:", status)
-        print("Response:", data)
+            print("\n--- VALIDATING ON SERVER A ---")
+            srv, status, data = post(SERVER_VALIDATE, "/validate", payload)
+            print("Server:", srv)
+            print("Status:", status)
+            print(json.dumps(data, indent=4, default=str))
 
-        print("\nSleeping 60 seconds...\n")
-        time.sleep(60)
+            # ---- PING SERVER B TO KEEP ALIVE ----
+            print("\n--- PINGING SERVER B (KEEP ALIVE) ---")
+            srv, status, data = get(SERVER_PING)
+            print("Server:", srv)
+            print("Status:", status)
+            print("Response:", data)
+
+        except Exception as e:
+            # Catch ALL exceptions so the loop never dies silently
+            print("\n!!! LOOP ERROR (will retry in 60s) !!!")
+            print(str(e))
+
+        print(f"\nSleeping {INTERVAL_SECONDS} seconds...\n")
+        time.sleep(INTERVAL_SECONDS)
+
+
+def start_background_thread():
+    t = threading.Thread(target=background_loop, daemon=True)
+    t.start()
+    return t
 
 # ============================
-# START BACKGROUND THREAD
+# WATCHDOG — restarts thread if it ever dies
 # ============================
-threading.Thread(target=background_loop, daemon=True).start()
+def watchdog():
+    t = start_background_thread()
+    while True:
+        time.sleep(30)
+        if not t.is_alive():
+            print("!!! Background thread died — restarting !!!")
+            t = start_background_thread()
+
+threading.Thread(target=watchdog, daemon=True).start()
 
 # ============================
-# WEB ENDPOINT (Render needs this)
+# WEB ENDPOINTS (Render needs this)
 # ============================
 @app.get("/")
 def home():
     return {"status": "running", "message": "Validation + KeepAlive loop active"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
