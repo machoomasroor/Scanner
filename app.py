@@ -1,19 +1,22 @@
 import requests
 import json
 import time
+import threading
 from datetime import datetime
+from fastapi import FastAPI
 
 # ============================
 # CONFIG — TWO RENDER SERVERS
 # ============================
 SERVERS = [
-    "https://license-server-3ciz.onrender.com",   # Render Server A
-    "https://license-server-1-o9cg.onrender.com"  # Render Server B
+    "https://license-server-3ciz.onrender.com",
+    "https://license-server-1-o9cg.onrender.com"
 ]
 
 SERIAL_KEY = "PLAN30-TEST-0001"
 MACHINE_ID = "machine1"
 
+app = FastAPI()
 
 # ============================
 # API CALL HELPER
@@ -26,43 +29,37 @@ def post(server, endpoint, payload):
     except Exception as e:
         return server, None, {"error": str(e)}
 
+# ============================
+# VALIDATION LOOP
+# ============================
+def validation_loop():
+    while True:
+        print("\n==============================================")
+        print("CHECK TIME:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print("==============================================")
+
+        payload = {
+            "serial": SERIAL_KEY,
+            "machine_id": MACHINE_ID
+        }
+
+        for server in SERVERS:
+            srv, status, data = post(server, "/validate", payload)
+            print(f"\n--- Server: {srv} ---")
+            print("Status:", status)
+            print(json.dumps(data, indent=4, default=str))
+
+        print("\nSleeping 60 seconds...\n")
+        time.sleep(60)
 
 # ============================
-# VALIDATE BOTH SERVERS
+# START BACKGROUND THREAD
 # ============================
-def validate_both_servers():
-    payload = {
-        "serial": SERIAL_KEY,
-        "machine_id": MACHINE_ID
-    }
-
-    print("\n==============================")
-    print(" VALIDATING BOTH SERVERS ")
-    print("==============================")
-
-    for server in SERVERS:
-        srv, status, data = post(server, "/validate", payload)
-        print(f"\n--- Server: {srv} ---")
-        print("Status:", status)
-        print(json.dumps(data, indent=4, default=str))
-
+threading.Thread(target=validation_loop, daemon=True).start()
 
 # ============================
-# CONTINUOUS VALIDATION LOOP
+# WEB ENDPOINT (Render needs this)
 # ============================
-if __name__ == "__main__":
-    print("Starting continuous validation loop (every 60 seconds)...")
-
-    try:
-        while True:
-            print("\n==============================================")
-            print("CHECK TIME:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            print("==============================================")
-
-            validate_both_servers()
-
-            print("\nSleeping 60 seconds...\n")
-            time.sleep(60)
-
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
+@app.get("/")
+def home():
+    return {"status": "running", "message": "Validation loop active"}
