@@ -17,7 +17,7 @@ MACHINE_ID = "machine1"
 app = FastAPI()
 
 # ============================
-# API CALL HELPERS
+# API CALL HELPER
 # ============================
 def post(server, endpoint, payload):
     url = f"{server}{endpoint}"
@@ -67,12 +67,9 @@ def background_loop():
         time.sleep(60)
 
 # ============================
-# START LOOP ON FASTAPI STARTUP
+# START BACKGROUND THREAD
 # ============================
-@app.on_event("startup")
-def start_background_tasks():
-    print("Starting background validation + keep-alive loop...")
-    threading.Thread(target=background_loop, daemon=True).start()
+threading.Thread(target=background_loop, daemon=True).start()
 
 # ============================
 # WEB ENDPOINT (Render needs this)
