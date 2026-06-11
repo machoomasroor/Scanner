@@ -11,6 +11,7 @@ from fastapi import FastAPI
 # ============================
 SERVER_VALIDATE = "https://license-server-3ciz.onrender.com"   # Server A (real validation)
 SERVER_PING = "https://license-server-1-o9cg.onrender.com"      # Server B (keep alive)
+SERVER_DASHBOARD = "https://dashboard-ovgl.onrender.com"        # Server C (keep alive)
 
 # Set YOUR own Render service URL here so the service can ping itself to stay awake
 # Example: "https://license-server-1-o9cg.onrender.com"
@@ -75,6 +76,13 @@ def background_loop():
             # ---- PING SERVER B TO KEEP ALIVE ----
             print("\n--- PINGING SERVER B (KEEP ALIVE) ---")
             srv, status, data = get(SERVER_PING)
+            print("Server:", srv)
+            print("Status:", status)
+            print("Response:", data)
+
+            # ---- PING SERVER C TO KEEP ALIVE ----
+            print("\n--- PINGING SERVER C (KEEP ALIVE) ---")
+            srv, status, data = get(SERVER_DASHBOARD)
             print("Server:", srv)
             print("Status:", status)
             print("Response:", data)
